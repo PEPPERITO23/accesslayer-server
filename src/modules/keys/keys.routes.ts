@@ -17,16 +17,27 @@ import {
    PRICE_HISTORY_INTERVALS,
 } from './key-price-history.service';
 import { getKeyFees, KeyNotFoundError } from './key-fees.service';
+import { getKeyLpStats, getKeyLpHistory } from './key-lp.service';
 import { getKeyRelaunchHistory } from './key-relaunch.service';
 import {
    getOraclePrice,
    KeyNotFoundError as OracleKeyNotFoundError,
    OraclePriceNotFoundError,
 } from './oracle-price.service';
+import {
+   getTwapPrice,
+   KeyNotFoundError as TwapKeyNotFoundError,
+} from './key-twap.service';
+import {
+   getKeyMetadata,
+   KeyMetadataNotFoundError,
+} from './key-metadata-sync.service';
+import { TWAP_WINDOWS } from '../../constants/redis.constants';
 import { cacheControl } from '../../middlewares/cache-control.middleware';
 import { envConfig } from '../../config';
 import { getKeyProposals, getProposalForVoting } from './key-proposals.service';
 import { getKeySupply } from './key-supply.service';
+import { httpGetKeyLeaderboard } from './key-leaderboard.controller';
 
 import { KeySearchQueryTooShortError, searchKeys } from './key-search.service';
 import { KEY_SEARCH_MIN_QUERY_LENGTH } from '../../constants/notifications.constants';
@@ -34,6 +45,7 @@ import dividendRouter from '../dividends/dividend.routes';
 import whitelistRouter from '../whitelist/whitelist.routes';
 import {
    requireJwtAuth,
+   requireKeyCreator,
    AuthenticatedRequest,
 } from '../../middlewares/jwt-auth.middleware';
 import {
@@ -55,6 +67,11 @@ import {
 } from '../creator/creator-profile.service';
 
 import { cacheGetJson, cacheSetJson } from '../../utils/redis.utils';
+import {
+   getKeyVestingHistory,
+   getKeyVestingSummary,
+   KeyVestingNotFoundError,
+} from '../vesting/vesting.service';
 import { fetchCreatorProfilesByIds } from '../../utils/creator-batch.utils';
 import {
    castKeyProposalVote,
@@ -66,6 +83,7 @@ import {
    BuybackPriceNotSetError,
    BuybackWindowClosedError,
    deprecateKey,
+   getKeyDeprecationStatus,
    InsufficientPositionError,
    KeyAlreadyDeprecatedError,
    KeyNotDeprecatedError,
@@ -98,6 +116,25 @@ import {
    matchTierForLockPeriod,
    calculateEffectiveWeight,
 } from '../staking/staking.service';
+import { getKeyCurveMilestones } from './key-milestones.service';
+import { getSunsetWatchList } from './key-sunset-watch.service';
+import {
+   getKeyPaymentAssetAnalytics,
+   getPlatformPaymentAssetDistribution,
+} from './key-analytics.service';
+import {
+   getCircuitBreakerState,
+   KeyNotFoundError as CircuitBreakerKeyNotFoundError,
+} from './circuit-breaker.service';
+import { circuitBreakerQuerySchema } from './circuit-breaker.schemas';
+import {
+   simulateKeyTrade,
+   type SimulateSide,
+   InsufficientCirculatingSupplyError,
+   QuantityExceedsLimitError,
+   BatchSizeExceedsLimitError,
+} from './key-simulate.service';
+import { getKeyTwap } from './key-twap-window.service';
 
 const priceHistoryQuerySchema = z.object({
    from: z.string().datetime(),
@@ -121,6 +158,11 @@ const walletQuerySchema = z.object({
    wallet: StellarAddressSchema,
 });
 
+const lpHistoryQuerySchema = z.object({
+   limit: z.coerce.number().int().positive().max(100).optional().default(20),
+   cursor: z.string().min(1).optional(),
+});
+
 const priceImpactQuerySchema = z.object({
    quantity: z.string().transform(v => {
       const num = parseInt(v, 10);
@@ -130,6 +172,10 @@ const priceImpactQuerySchema = z.object({
       return num;
    }),
    direction: z.enum(['buy', 'sell']),
+});
+
+const twapQuerySchema = z.object({
+   window: z.enum(TWAP_WINDOWS).optional(),
 });
 
 const buybackPoolHistoryQuerySchema = z.object({
@@ -274,6 +320,12 @@ router.post('/batch', async (req, res, next) => {
 });
 
 /**
+ * GET /api/v1/keys/leaderboard
+ * Ranks creator keys by holder count, trading volume, or price performance.
+ */
+router.get('/leaderboard', httpGetKeyLeaderboard);
+
+/**
  * GET /api/v1/keys/search?q=
  * Full-text search over creator name and description.
  * Must be registered before /:keyId routes.
@@ -307,6 +359,169 @@ router.get('/search', async (req, res, next) => {
          sendError(res, 400, ErrorCode.VALIDATION_ERROR, error.message);
          return;
       }
+      next(error);
+   }
+});
+
+// ── Pagination constants ────────────────────────────────────
+const DEFAULT_SUNSET_WATCH_LIMIT = 20;
+const MAX_SUNSET_WATCH_LIMIT = 100;
+
+const sunsetWatchQuerySchema = z.object({
+   limit: z.coerce
+      .number()
+      .int()
+      .min(1)
+      .max(MAX_SUNSET_WATCH_LIMIT)
+      .default(DEFAULT_SUNSET_WATCH_LIMIT),
+   offset: z.coerce.number().int().min(0).default(0),
+});
+
+/**
+ * GET /api/v1/keys/sunset-watch
+ *
+ * Admin-only endpoint that returns all creator keys approaching or past the
+ * inactivity sunset threshold, plus any keys already flagged on-chain via a
+ * KeySunsetFlagged event.
+ *
+ * Each item includes:
+ *   - keyId, handle, displayName, circulatingSupply
+ *   - lastTradeAt        — ISO timestamp of the last KEY_BOUGHT/KEY_SOLD, or null
+ *   - daysSinceLastTrade — whole days elapsed since last trade, or null
+ *   - sunsetFlaggedAt    — ISO timestamp the on-chain flag was processed, or null
+ *   - sunsetStatus       — 'sunset_pending' | 'threshold_exceeded' | 'near_threshold'
+ *
+ * Results are sorted by inactivity duration descending (most inactive first).
+ * Keys that have never traded appear after all keys with a known last trade.
+ *
+ * Query parameters:
+ *   - limit  (default 20, max 100)
+ *   - offset (default 0)
+ *
+ * Responses:
+ *   200 — paginated list of sunset-watch items
+ *   400 — invalid query parameters
+ *   401 — missing or invalid admin token
+ *   403 — token present but role !== 'admin'
+ *
+ * Must be registered before /:keyId to avoid route shadowing.
+ */
+router.get(
+   '/sunset-watch',
+   adminGuard,
+   async (req: AdminRequest, res, next) => {
+      const parsed = sunsetWatchQuerySchema.safeParse(req.query);
+      if (!parsed.success) {
+         sendValidationError(
+            res,
+            'Invalid query parameters',
+            zodIssuesToDetails(parsed.error.issues)
+         );
+         return;
+      }
+
+      try {
+         const result = await getSunsetWatchList({
+            limit: parsed.data.limit,
+            offset: parsed.data.offset,
+         });
+         sendSuccess(res, result);
+      } catch (error) {
+         logger.error({ error }, 'GET /keys/sunset-watch failed');
+         next(error);
+      }
+   }
+);
+
+/**
+ * GET /api/v1/keys/analytics/payment-assets
+ *
+ * Admin-only. Returns the platform-wide distribution of payment assets used
+ * across all key purchases — trade count, unique buyers, total price in
+ * stroops, and percentage share per asset.
+ *
+ * Must be registered before /:keyId to avoid route shadowing.
+ *
+ * Responses:
+ *   200 — PlatformPaymentAssetDistribution
+ *   401/403 — missing or invalid admin token
+ */
+router.get(
+   '/analytics/payment-assets',
+   adminGuard,
+   async (_req: AdminRequest, res, next) => {
+      try {
+         sendSuccess(res, await getPlatformPaymentAssetDistribution());
+      } catch (error) {
+         logger.error({ error }, 'GET /keys/analytics/payment-assets failed');
+         next(error);
+      }
+   }
+);
+
+/**
+ * GET /api/v1/keys/:keyId/analytics
+ *
+ * Returns the payment-asset breakdown for a single key: trade count, unique
+ * buyers, and total price in stroops grouped by paymentAsset.
+ * Resolves keyId by DB id or handle.
+ *
+ * Publicly accessible — the payment-asset mix for a key is not sensitive.
+ *
+ * Responses:
+ *   200 — KeyPaymentAssetAnalytics
+ *   404 — key not found
+ */
+router.get('/:keyId/analytics', async (req, res, next) => {
+   try {
+      sendSuccess(res, await getKeyPaymentAssetAnalytics(String(req.params.keyId)));
+   } catch (error) {
+      if (error instanceof KeyNotFoundError) {
+         sendNotFound(res, 'Key');
+         return;
+      }
+      logger.error({ error, keyId: req.params.keyId }, 'GET /keys/:keyId/analytics failed');
+      next(error);
+   }
+});
+
+/**
+ * GET /api/v1/keys/:keyId/circuit-breaker?limit=&offset=
+ *
+ * Returns the key's circuit breaker state: the configured max_bps (read from
+ * the contract and cached for 5 minutes, falling back to the indexed value),
+ * whether the breaker is currently active (the latest trip's actual bps met or
+ * exceeded the threshold), and the paginated trip history, newest first
+ * (50 per page by default). Resolves keyId by DB id or handle.
+ *
+ * Responses:
+ *   200 — { keyId, maxBps, active, config, tripCount, limit, offset, trips }
+ *   400 — invalid pagination query
+ *   404 — key not found
+ */
+router.get('/:keyId/circuit-breaker', async (req, res, next) => {
+   const parsed = circuitBreakerQuerySchema.safeParse(req.query);
+   if (!parsed.success) {
+      sendValidationError(
+         res,
+         'Invalid circuit breaker query',
+         zodIssuesToDetails(parsed.error.issues)
+      );
+      return;
+   }
+
+   try {
+      const keyId = String(req.params.keyId);
+      sendSuccess(res, await getCircuitBreakerState(keyId, parsed.data));
+   } catch (error) {
+      if (error instanceof CircuitBreakerKeyNotFoundError) {
+         sendNotFound(res, 'Key');
+         return;
+      }
+      logger.error(
+         { error, keyId: req.params.keyId },
+         'GET /keys/:keyId/circuit-breaker failed'
+      );
       next(error);
    }
 });
@@ -374,6 +589,60 @@ router.get(
 );
 
 /**
+ * GET /api/v1/keys/:keyId/metadata
+ *
+ * Returns synced on-chain creator key metadata (name, symbol, description,
+ * imageCid, imageUrl) along with a `stale` flag when synchronization is
+ * delayed by more than 10 minutes (#986).
+ */
+router.get('/:keyId/metadata', async (req, res, next) => {
+   const keyId = String(req.params.keyId);
+   try {
+      const metadata = await getKeyMetadata(keyId);
+      sendSuccess(res, metadata);
+   } catch (error) {
+      if (error instanceof KeyMetadataNotFoundError) {
+         sendNotFound(res, 'Key metadata');
+         return;
+      }
+      next(error);
+   }
+});
+
+
+/**
+ * GET /api/v1/keys/:keyId/price/twap?window=1h|4h|24h
+ *
+ * Returns the cached TWAP for the requested window, the bonding-curve
+ * spot price, the spot-vs-TWAP delta percentage, and a stale flag when
+ * the computation job is behind (>10 minutes since computedAt).
+ * Read-through: a cold cache is computed on demand and cached with
+ * a TTL matching the window size.
+ */
+router.get('/:keyId/price/twap', async (req, res, next) => {
+   const parsed = twapQuerySchema.safeParse(req.query);
+   if (!parsed.success) {
+      sendValidationError(
+         res,
+         'Invalid twap query',
+         zodIssuesToDetails(parsed.error.issues)
+      );
+      return;
+   }
+   try {
+      const keyId = String(req.params.keyId);
+      const window = parsed.data.window ?? '1h';
+      sendSuccess(res, await getTwapPrice(keyId, window));
+   } catch (error) {
+      if (error instanceof TwapKeyNotFoundError) {
+         sendNotFound(res, 'Key');
+         return;
+      }
+      next(error);
+   }
+});
+
+/**
  * GET /api/v1/keys/:keyId
  * Public key detail response includes supply milestone metadata.
  */
@@ -385,6 +654,72 @@ router.get('/:keyId', async (req, res, next) => {
       }
       const profile = await getCreatorProfile(keyId);
       sendSuccess(res, profile, 200, 'Key retrieved successfully');
+   } catch (error) {
+      next(error);
+   }
+});
+
+// ── GET /:keyId/curve-config ──────────────────────────────────
+
+router.get('/:keyId/curve-config', async (req, res, next) => {
+   const keyId = String(req.params.keyId);
+   try {
+      const creator = await prisma.creatorProfile.findFirst({
+         where: { OR: [{ id: keyId }, { handle: keyId }] },
+         select: { id: true, curveMilestones: true, baseExponent: true },
+      });
+      if (!creator) {
+         sendNotFound(res, 'Key');
+         return;
+      }
+
+      sendSuccess(res, {
+         keyId: creator.id,
+         milestones: (creator.curveMilestones as any) ?? [],
+         baseExponent: creator.baseExponent ?? 1,
+      });
+   } catch (error) {
+      next(error);
+   }
+});
+
+// ── GET /:keyId/twap (#866) ───────────────────────────────────
+// Distinct from GET /:keyId/price/twap (#963): this endpoint serves the
+// 1h/24h/7d window set and returns twapPrice/windowLedgers/snapshotCount,
+// with twapPrice null when fewer than two snapshots fall in the window.
+
+const twapWindowQuerySchema = z.object({
+   window: z.enum(['1h', '24h', '7d'], {
+      errorMap: () => ({ message: 'Invalid window param. Must be 1h, 24h, or 7d' }),
+   }),
+});
+
+router.get('/:keyId/twap', async (req, res, next) => {
+   const keyId = String(req.params.keyId);
+   const parsed = twapWindowQuerySchema.safeParse(req.query);
+   if (!parsed.success) {
+      sendError(
+         res,
+         422,
+         ErrorCode.UNPROCESSABLE_ENTITY,
+         'Invalid window param. Must be 1h, 24h, or 7d',
+         zodIssuesToDetails(parsed.error.issues)
+      );
+      return;
+   }
+
+   try {
+      const creator = await prisma.creatorProfile.findFirst({
+         where: { OR: [{ id: keyId }, { handle: keyId }] },
+         select: { id: true },
+      });
+      if (!creator) {
+         sendNotFound(res, 'Key');
+         return;
+      }
+
+      const result = await getKeyTwap(creator.id, parsed.data.window);
+      sendSuccess(res, result);
    } catch (error) {
       next(error);
    }
@@ -405,6 +740,163 @@ router.get('/:keyId/fees', async (req, res, next) => {
       next(error);
    }
 });
+
+const dynamicFeeQuerySchema = z.object({
+   amount: z.coerce.number().int().nonnegative(),
+   direction: z.enum(['buy', 'sell']),
+   wallet: StellarAddressSchema.optional(),
+});
+
+/**
+ * GET /api/v1/keys/:keyId/fee
+ * Computes the effective dynamic fee rate for a given trade, factoring in base fee,
+ * volume-tier discount, protocol fee, and creator royalty (#962).
+ */
+router.get('/:keyId/fee', async (req, res, next) => {
+   const parsed = dynamicFeeQuerySchema.safeParse(req.query);
+   if (!parsed.success) {
+      sendValidationError(
+         res,
+         'Invalid dynamic fee query',
+         zodIssuesToDetails(parsed.error.issues)
+      );
+      return;
+   }
+
+   try {
+      // We dynamically load the service here to avoid massive circular imports if any
+      const { getDynamicFeeRate } = await import('./key-dynamic-fee.service');
+      
+      // If the request is authenticated, we use the user's wallet for the volume discount
+      // In a real implementation we would extract the wallet from the JWT middleware (req.user),
+      // but this endpoint is public. We optionally accept a wallet address to preview discount.
+      const wallet = parsed.data.wallet;
+
+      sendSuccess(
+         res,
+         await getDynamicFeeRate(
+            req.params.keyId,
+            parsed.data.amount,
+            parsed.data.direction,
+            wallet
+         )
+      );
+   } catch (error) {
+      if (error instanceof KeyNotFoundError) {
+         sendNotFound(res, 'Key');
+         return;
+      }
+      next(error);
+   }
+});
+
+/**
+ * GET /api/v1/keys/:keyId/lp-stats
+ * Total LP contributed and current LP balance for a key, sourced from
+ * LPAllocationSent contract events. Cached 60s (#943).
+ */
+router.get('/:keyId/lp-stats', async (req, res, next) => {
+   try {
+      sendSuccess(res, await getKeyLpStats(String(req.params.keyId)));
+   } catch (error) {
+      if (error instanceof KeyNotFoundError) {
+         sendNotFound(res, 'Key');
+         return;
+      }
+      next(error);
+   }
+});
+
+/**
+ * GET /api/v1/keys/:keyId/lp-history?limit=&cursor=
+ * Paginated LP contribution history for a key, newest first (#943).
+ */
+router.get('/:keyId/lp-history', async (req, res, next) => {
+   const parsed = lpHistoryQuerySchema.safeParse(req.query);
+   if (!parsed.success) {
+      sendValidationError(
+         res,
+         'Invalid pagination query',
+         zodIssuesToDetails(parsed.error.issues)
+      );
+      return;
+   }
+   try {
+      sendSuccess(
+         res,
+         await getKeyLpHistory({
+            keyId: String(req.params.keyId),
+            ...parsed.data,
+         })
+      );
+   } catch (error) {
+      if (error instanceof KeyNotFoundError) {
+         sendNotFound(res, 'Key');
+         return;
+      }
+      next(error);
+   }
+});
+
+/**
+ * GET /api/v1/keys/:keyId/vesting
+ * Creator-only: returns the creator key vesting summary for all beneficiaries.
+ */
+router.get(
+   '/:keyId/vesting',
+   requireKeyCreator('keyId'),
+   async (req: AuthenticatedRequest, res, next) => {
+      try {
+         const keyId = String(req.params.keyId);
+         const cacheKey = `key:vesting:${keyId}`;
+         const cached = await cacheGetJson<any>(cacheKey);
+         if (cached !== null) {
+            return sendSuccess(res, cached);
+         }
+
+         const ledger = await prisma.indexedLedger.findFirst({
+            orderBy: { updatedAt: 'desc' },
+            select: { ledger: true },
+         });
+         const currentLedger = ledger?.ledger ?? 0;
+
+         const result = await getKeyVestingSummary(keyId, currentLedger);
+         await cacheSetJson(cacheKey, result, 60);
+         sendSuccess(res, result);
+      } catch (error) {
+         if (error instanceof KeyVestingNotFoundError) {
+            sendNotFound(res, 'Vesting schedule');
+            return;
+         }
+         next(error);
+      }
+   }
+);
+
+router.get(
+   '/:keyId/vesting/history',
+   requireKeyCreator('keyId'),
+   async (req: AuthenticatedRequest, res, next) => {
+      try {
+         const keyId = String(req.params.keyId);
+         const limitParam = req.query.limit;
+         const limit = Array.isArray(limitParam)
+            ? Number(limitParam[0] ?? 20)
+            : Number(limitParam ?? 20);
+         const cacheKey = `key:vesting:${keyId}:history`;
+         const cached = await cacheGetJson<any>(cacheKey);
+         if (cached !== null) {
+            return sendSuccess(res, cached);
+         }
+
+         const history = await getKeyVestingHistory(keyId, Number.isFinite(limit) ? limit : 20);
+         await cacheSetJson(cacheKey, history, 60);
+         sendSuccess(res, history);
+      } catch (error) {
+         next(error);
+      }
+   }
+);
 
 /**
  * GET /api/v1/keys/:keyId/proposals?status=active|closed
@@ -541,6 +1033,35 @@ router.get('/:keyId/supply', async (req, res, next) => {
       next(error);
    }
 });
+
+/**
+ * GET /api/v1/keys/:keyId/curve/milestones
+ * Return all milestones, current progress, and graduation status.
+ */
+router.get(
+   '/:keyId/curve/milestones',
+   cacheControl({ maxAge: 30, type: 'public', mustRevalidate: true }),
+   async (req, res, next) => {
+      const keyId = String(req.params.keyId);
+      const cacheKey = `curve-milestones:${keyId}`;
+      try {
+         const cached = await cacheGetJson<any>(cacheKey);
+         if (cached !== null) {
+            return sendSuccess(res, cached);
+         }
+
+         const result = await getKeyCurveMilestones(keyId);
+         await cacheSetJson(cacheKey, result, 30);
+         sendSuccess(res, result);
+      } catch (error) {
+         if (error instanceof Error && error.name === 'KeyNotFoundError') {
+            sendNotFound(res, 'Key');
+            return;
+         }
+         next(error);
+      }
+   }
+);
 
 /**
  * GET /api/v1/keys/:keyId/price-impact?quantity=&direction=buy|sell
@@ -865,6 +1386,81 @@ router.get('/:keyId/price-history', async (req, res, next) => {
    } catch (error) {
       next(error);
    }
+ });
+
+// ── GET /:keyId/simulate ──────────────────────────────────────
+
+router.get('/:keyId/simulate', async (req, res, next) => {
+   const keyId = String(req.params.keyId);
+   const rawSide = req.query.side;
+   const rawQty = req.query.quantity ?? req.query.quantities;
+
+   if (rawSide !== 'buy' && rawSide !== 'sell') {
+      sendError(
+         res,
+         422,
+         ErrorCode.UNPROCESSABLE_ENTITY,
+         "side must be 'buy' or 'sell'"
+      );
+      return;
+   }
+
+   if (!rawQty || typeof rawQty !== 'string') {
+      sendError(
+         res,
+         422,
+         ErrorCode.UNPROCESSABLE_ENTITY,
+         'quantity is required'
+      );
+      return;
+   }
+
+   const quantities = rawQty
+      .split(',')
+      .map((s: string) => s.trim())
+      .filter(Boolean)
+      .map((s: string) => Number(s));
+
+   if (
+      quantities.length === 0 ||
+      quantities.some((q: number) => isNaN(q) || !Number.isInteger(q) || q <= 0)
+   ) {
+      sendError(
+         res,
+         422,
+         ErrorCode.UNPROCESSABLE_ENTITY,
+         'quantities must be positive integers'
+      );
+      return;
+   }
+
+   try {
+      const result = await simulateKeyTrade(
+         keyId,
+         quantities,
+         rawSide as SimulateSide
+      );
+      sendSuccess(res, result);
+   } catch (error) {
+      if (error instanceof KeyNotFoundError) {
+         sendNotFound(res, 'Key');
+         return;
+      }
+      if (
+         error instanceof InsufficientCirculatingSupplyError ||
+         error instanceof QuantityExceedsLimitError ||
+         error instanceof BatchSizeExceedsLimitError
+      ) {
+         sendError(
+            res,
+            422,
+            ErrorCode.UNPROCESSABLE_ENTITY,
+            error.message
+         );
+         return;
+      }
+      next(error);
+   }
 });
 
 // Mount dividend routes
@@ -1092,6 +1688,40 @@ router.post(
 
 router.all('/:keyId/deprecate', (_req, res) => {
    res.set('Allow', 'POST').sendStatus(405);
+});
+
+// ── GET /:keyId/deprecation ───────────────────────────────────
+// Public read of a key's deprecation status: status, reason, deprecatedAt,
+// and an embedded summary of the designated successor key, if any.
+
+/**
+ * GET /api/v1/keys/:keyId/deprecation
+ *
+ * Returns the current deprecation status for a key. `status` is `active`
+ * when `deprecatedAt` is unset, otherwise `deprecated`. `successor` embeds
+ * `{ id, name, avatarUrl, currentPrice }` when a successor key was
+ * designated and still exists; otherwise `null`.
+ */
+router.get('/:keyId/deprecation', async (req, res, next) => {
+   try {
+      const keyId = String(req.params.keyId);
+      const result = await getKeyDeprecationStatus(keyId);
+      sendSuccess(res, result, 200);
+   } catch (error) {
+      if (error instanceof KeyNotFoundError) {
+         sendNotFound(res, 'Key');
+         return;
+      }
+      logger.error(
+         { error, keyId: req.params.keyId },
+         'Get key deprecation status failed'
+      );
+      next(error);
+   }
+});
+
+router.all('/:keyId/deprecation', (_req, res) => {
+   res.set('Allow', 'GET').sendStatus(405);
 });
 
 // ── POST /:keyId/buyback ─────────────────────────────────────
