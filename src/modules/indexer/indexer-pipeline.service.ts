@@ -87,8 +87,6 @@ export async function processTradeEvents(
       if (!Number.isFinite(pricePerKeyXlm) || pricePerKeyXlm < 0) {
          pricePerKeyXlm = 0;
       }
-      const { creatorId, actor, amount, price, feePaid, tradeAt, ledger } =
-         event;
       // payment_asset is optional — absent events default to 'XLM' (#934).
       const paymentAsset: string =
          typeof event.paymentAsset === 'string' && event.paymentAsset.trim() !== ''
