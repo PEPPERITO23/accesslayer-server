@@ -16,6 +16,7 @@ import subscriptionRouter from './subscriptions/subscription.routes';
 import webhookRouter from './webhooks/webhook.router';
 import walletsRouter from './wallets/wallets.routes';
 import alertsRouter from './alerts/alert.router';
+import invoiceRouter from './invoice/invoice.routes';
 import freezeRouter from './freeze/freeze.routes';
 import platformRouter from './platform/platform.routes';
 
@@ -71,6 +72,7 @@ router.use('/ledger', routeBodySizeLimit('default'), ledgerRouter);
 router.use('/admin', routeBodySizeLimit('admin'), adminRouter);
 router.use('/activity', routeBodySizeLimit('default'), activityRouter);
 router.use('/ownership', routeBodySizeLimit('default'), ownershipRouter);
+router.use('/invoices', routeBodySizeLimit('default'), invoiceRouter);
 router.use('/subscriptions', routeBodySizeLimit('default'), subscriptionRouter);
 router.use(CREATORS_BASE, routeBodySizeLimit('creators'), webhookRouter);
 router.use('/wallets', routeBodySizeLimit('default'), walletsRouter);
