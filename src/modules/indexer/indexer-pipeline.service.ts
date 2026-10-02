@@ -109,9 +109,6 @@ export async function processTradeEvents(
          );
          throw error;
       }
-      const { creatorId, actor, amount, price, feePaid, tradeAt, ledger } =
-         event;
-
       // 1. Create corresponding Activity record
       await prisma.activity.create({
          data: {
